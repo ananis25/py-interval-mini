@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Interval Actions SPA</title>
+    <!-- Load React and ReactDOM from CDN -->
+    <script crossorigin src="https://unpkg.com/react@17/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"></script>
+    <!-- Babel for in-browser JSX transformation -->
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+        }
+
+        button {
+            margin: 5px 0;
+            padding: 8px 12px;
+            font-size: 1rem;
+        }
+
+        input {
+            padding: 6px;
+            font-size: 1rem;
+            margin-right: 8px;
+        }
+
+        pre {
+            background: #f4f4f4;
+            padding: 10px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="root"></div>
+    <!-- Our React code -->
+    <script type="text/babel">
+        // A minimal React SPA for the Interval-like server
+
+        function ActionList({ onActionSelect }) {
+            const [actions, setActions] = React.useState([]);
+            const [transactions, setTransactions] = React.useState([]);
+
+            React.useEffect(() => {
+                // Fetch available actions and transactions on component mount
+                fetchActions();
+                fetchTransactions();
+            }, []);
+
+            const fetchActions = async () => {
+                const response = await fetch("/api/action/list", {
+                    method: "POST"
+                });
+                const data = await response.json();
+                setActions(data);
+            };
+
+            const fetchTransactions = async () => {
+                const response = await fetch("/api/transaction/list", {
+                    method: "POST"
+                });
+                const data = await response.json();
+                setTransactions(data);
+            };
+
+            return (
+                <div>
+                    <h2>Available Actions</h2>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+                        {actions.map(action => (
+                            <div key={action.slug} style={{ border: '1px solid #ddd', padding: '15px', borderRadius: '4px' }}>
+                                <h3>{action.slug}</h3>
+                                <button onClick={() => onActionSelect(action.slug)}>
+                                    Run Action
+                                </button>
+                                <h4>Recent Transactions</h4>
+                                {transactions
+                                    .filter(tx => tx.action_slug === action.slug)
+                                    .map(tx => (
+                                        <div key={tx.id} style={{
+                                            padding: '8px',
+                                            margin: '4px 0',
+                                            backgroundColor: '#f5f5f5',
+                                            borderRadius: '4px'
+                                        }}>
+                                            <a href={`#action/${action.slug}/transaction/${tx.id}`}>
+                                                #{tx.id}
+                                            </a>
+                                            <span style={{ marginLeft: '8px', color: getStatusColor(tx.status) }}>
+                                                {tx.status}
+                                            </span>
+                                        </div>
+                                    ))}
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            );
+        }
+
+        function TransactionView({ actionSlug, transactionId, onClose }) {
+            const [state, setState] = React.useState(null);
+            const [inputValue, setInputValue] = React.useState("");
+            const [loading, setLoading] = React.useState(false);
+
+            React.useEffect(() => {
+                // Start listening for events immediately
+                const eventSource = new EventSource(`/api/transaction/${transactionId}/events`);
+                eventSource.onmessage = (e) => {
+                    const newState = JSON.parse(e.data);
+                    setState(newState);
+                };
+                return () => eventSource.close();
+            }, [transactionId]);
+
+            // Start a new transaction
+            const startTransaction = async () => {
+                setLoading(true);
+                try {
+                    const response = await fetch("/api/transaction/invoke", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            actionSlug,
+                            transactionId
+                        }),
+                    });
+                    if (!response.ok) {
+                        throw new Error("Failed to start transaction");
+                    }
+                } catch (e) {
+                    console.error(e);
+                }
+                setLoading(false);
+            };
+
+            // When an IO request is pending, send the response to the server
+            const respondIO = async () => {
+                if (!state.ioRequest) return;
+                try {
+                    const res = await fetch("/api/transaction/io", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            transactionId,
+                            requestId: state.ioRequest.id,
+                            body: inputValue,
+                        }),
+                    });
+                    if (!res.ok) {
+                        throw new Error("Failed to respond to IO request");
+                    }
+                    setInputValue("");
+                } catch (e) {
+                    console.error(e);
+                }
+            };
+
+            return (
+                <div>
+                    <button onClick={onClose}>&larr; Back to Actions</button>
+                    <h2>Transaction {transactionId}</h2>
+
+                    {state && (
+                        <div style={{ marginTop: "20px" }}>
+                            <p>Status: {state.status}</p>
+                            {state.status === "not_initialized" && (
+                                <div>
+                                    <p>Start a new transaction for action: {actionSlug}</p>
+                                    <button onClick={startTransaction} disabled={loading}>
+                                        {loading ? 'Starting...' : 'Start Transaction'}
+                                    </button>
+                                </div>
+                            )}
+                            {state.status === "suspended" && state.ioRequest && (
+                                <div style={{ margin: "10px 0" }}>
+                                    <p>{state.ioRequest.payload.label || "Enter input:"}</p>
+                                    <input
+                                        type="text"
+                                        value={inputValue}
+                                        onChange={(e) => setInputValue(e.target.value)}
+                                    />
+                                    <button onClick={respondIO}>Submit</button>
+                                </div>
+                            )}
+                            {(state.status === "success" || state.status === "error") && (
+                                <div>
+                                    <p>Result:</p>
+                                    <pre>{JSON.stringify(state.result, null, 2)}</pre>
+                                    <button onClick={() => {
+                                        const nextTransactionId = crypto.randomUUID();
+                                        window.location.hash = `action/${actionSlug}/transaction/${nextTransactionId}`;
+                                    }}>
+                                        Start New Transaction
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        function App() {
+            const [currentView, setCurrentView] = React.useState({ type: 'list' });
+            const [key, setKey] = React.useState(0); // Add a key to force re-render
+
+            // Handle hash-based routing
+            React.useEffect(() => {
+                const handleHashChange = () => {
+                    const hash = window.location.hash;
+                    if (!hash) {
+                        setCurrentView({ type: 'list' });
+                        return;
+                    }
+
+                    const match = hash.match(/#action\/(.+)\/transaction\/(.+)/);
+                    if (match) {
+                        setCurrentView({
+                            type: 'transaction',
+                            actionSlug: match[1],
+                            transactionId: match[2]  // Keep as string
+                        });
+                        setKey(k => k + 1); // Force re-render on hash change
+                    }
+                };
+
+                window.addEventListener('hashchange', handleHashChange);
+                handleHashChange(); // Handle initial hash
+                return () => window.removeEventListener('hashchange', handleHashChange);
+            }, []);
+
+            const handleActionSelect = (slug) => {
+                const newTransactionId = crypto.randomUUID();
+                window.location.hash = `action/${slug}/transaction/${newTransactionId}`;
+            };
+
+            return (
+                <div>
+                    <h1>Interval Actions</h1>
+                    {currentView.type === 'list' ? (
+                        <ActionList onActionSelect={handleActionSelect} />
+                    ) : (
+                        <TransactionView
+                            key={key} // Add key to force re-render
+                            actionSlug={currentView.actionSlug}
+                            transactionId={currentView.transactionId}
+                            onClose={() => window.location.hash = ''}
+                        />
+                    )}
+                </div>
+            );
+        }
+
+        // Helper function to get status color
+        function getStatusColor(status) {
+            const colors = {
+                running: '#2196F3',
+                success: '#4CAF50',
+                error: '#F44336',
+                suspended: '#FF9800'
+            };
+            return colors[status] || '#757575';
+        }
+
+        ReactDOM.render(<App />, document.getElementById("root"));
+    </script>
+</body>
+
+</html>
