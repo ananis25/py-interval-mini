@@ -1,14 +1,14 @@
-This is a small implementation of an [Interval](https://interval.com/) like system in Python. You write workflows (called as "actions") as async routines which suspend every time they need a human input. Each execution of an action is called a "transaction". The framework takes care of rendering the UI, collecting the input, and resuming the workflow. 
+I like the idea behind [Interval](https://interval.com/). You write workflows (called as "actions") as async routines which suspend every time they need a user input. Each execution of an action is called a "transaction". The framework takes care of rendering the UI, collecting the input, and resuming the workflow. 
 
-The Interval github org also has a [mini version](https://github.com/interval/mini/) of it, where the "actions" code the one developers are supposed to write, and the Interval "server", which is connected to by the end users are run in the same server. This makes things easier to run, if less scalable. 
+The Interval github org also has a [mini version](https://github.com/interval/mini/) of it, where the "actions" (code that implements the business logic), and the Interval "server" (what users connect to) are run in the same server. This makes things easier to run, if less scalable. 
 
-TODO: Acquire a lock on a transaction, so you only have one instance of it running at a time.
+This repo implements a single module version of Interval mini in python, backed by a sqlite database which makes action runs persistent. 
 
 ## How to run
 
 ```bash
 uv sync
-uv run sdk.py # implements some toy actions (workflows)
+uv run server.py # implements some toy actions (workflows)
 ```
 
 Access the UI in the web browser at `http://localhost:8000`.

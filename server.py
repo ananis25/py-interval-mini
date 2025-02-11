@@ -35,6 +35,23 @@ class EventType(enum.Enum):
 TIMEOUT_IO_REQUEST = 10
 
 
+class GlobalLock:
+    _locks: Dict[str, asyncio.Lock] = {}
+
+    @classmethod
+    async def acquire(cls, key: str) -> None:
+        if key not in cls._locks:
+            cls._locks[key] = asyncio.Lock()
+        await cls._locks[key].acquire()
+
+    @classmethod
+    async def release(cls, key: str) -> None:
+        if key in cls._locks:
+            cls._locks[key].release()
+            if not cls._locks[key].locked():
+                del cls._locks[key]
+
+
 # ------------------------------
 # DATABASE SCHEMA INITIALIZATION
 # ------------------------------
@@ -411,13 +428,15 @@ def create_interval_app(
             raise HTTPException(status_code=404, detail="Action not found")
 
         tx_id = str(uuid.uuid4())
-        tx = Transaction(tx_id, app)
 
+        await GlobalLock.acquire(tx_id)
+        tx = Transaction(tx_id, app)
         if app.state.transactions_active.get(tx_id, None) is not None:
             raise HTTPException(status_code=400, detail="Transaction already exists")
         asyncio.create_task(tx.run(action_slug))
-        print(f"Created transaction {tx_id}")
+        await GlobalLock.release(tx_id)
 
+        print(f"Created transaction {tx_id}")
         return {"status": "ok", "transactionId": tx_id}
 
     @app.get("/api/transaction/{transaction_id}/events")
@@ -440,6 +459,7 @@ def create_interval_app(
         print(f"Received IO response: {body}")
 
         tx_id = body["transactionId"]
+        await GlobalLock.acquire(tx_id)
 
         # Get or restore transaction
         if tx_id not in app.state.transactions_active:
@@ -476,6 +496,8 @@ def create_interval_app(
             raise HTTPException(status_code=400, detail="Request ID mismatch")
 
         tx.pending_io_request["future"].set_result(body["body"])
+        await GlobalLock.release(tx_id)
+
         return {"status": "ok"}
 
     @app.post("/api/transaction/list")
