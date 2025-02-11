@@ -1,6 +1,8 @@
 This is a small implementation of an [Interval](https://interval.com/) like system in Python. You write workflows (called as "actions") as async routines which suspend every time they need a human input. Each execution of an action is called a "transaction". The framework takes care of rendering the UI, collecting the input, and resuming the workflow. 
 
-The authors also implemented a [mini version](https://github.com/interval/mini/) of it, where the "actions" code the one developers are supposed to write, and the Interval "server", which is connected to by the end users are run in the same server. This makes things easier to run, if less scalable. 
+The Interval github org also has a [mini version](https://github.com/interval/mini/) of it, where the "actions" code the one developers are supposed to write, and the Interval "server", which is connected to by the end users are run in the same server. This makes things easier to run, if less scalable. 
+
+TODO: Acquire a lock on a transaction, so you only have one instance of it running at a time.
 
 ## How to run
 

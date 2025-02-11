@@ -109,35 +109,29 @@
             const [loading, setLoading] = React.useState(false);
 
             React.useEffect(() => {
-                // Start listening for events immediately
-                const eventSource = new EventSource(`/api/transaction/${transactionId}/events`);
+                let eventSource = new EventSource(`/api/transaction/${transactionId}/events`);
+
                 eventSource.onmessage = (e) => {
                     const newState = JSON.parse(e.data);
-                    setState(newState);
-                };
-                return () => eventSource.close();
-            }, [transactionId]);
+                    console.log("State update:", newState);
 
-            // Start a new transaction
-            const startTransaction = async () => {
-                setLoading(true);
-                try {
-                    const response = await fetch("/api/transaction/invoke", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            actionSlug,
-                            transactionId
-                        }),
-                    });
-                    if (!response.ok) {
-                        throw new Error("Failed to start transaction");
+                    if (!state || newState.updateCount > state.updateCount) {
+                        setState(newState);
+                    } else {
+                        console.log("Update already processed");
                     }
-                } catch (e) {
-                    console.error(e);
-                }
-                setLoading(false);
-            };
+                };
+                eventSource.onerror = (error) => {
+                    console.error('EventSource failed:', error);
+                    eventSource.close();
+                };
+
+                return () => {
+                    if (eventSource) {
+                        eventSource.close();
+                    }
+                };
+            }, [transactionId]);
 
             // When an IO request is pending, send the response to the server
             const respondIO = async () => {
@@ -171,10 +165,7 @@
                             <p>Status: {state.status}</p>
                             {state.status === "not_initialized" && (
                                 <div>
-                                    <p>Start a new transaction for action: {actionSlug}</p>
-                                    <button onClick={startTransaction} disabled={loading}>
-                                        {loading ? 'Starting...' : 'Start Transaction'}
-                                    </button>
+                                    <p>Transaction not found</p>
                                 </div>
                             )}
                             {state.status === "suspended" && state.ioRequest && (
@@ -192,9 +183,16 @@
                                 <div>
                                     <p>Result:</p>
                                     <pre>{JSON.stringify(state.result, null, 2)}</pre>
-                                    <button onClick={() => {
-                                        const nextTransactionId = crypto.randomUUID();
-                                        window.location.hash = `action/${actionSlug}/transaction/${nextTransactionId}`;
+                                    <button onClick={async () => {
+                                        const response = await fetch("/api/transaction/invoke", {
+                                            method: "POST",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ actionSlug }),
+                                        });
+                                        const data = await response.json();
+                                        if (response.ok) {
+                                            window.location.hash = `action/${actionSlug}/transaction/${data.transactionId}`;
+                                        }
                                     }}>
                                         Start New Transaction
                                     </button>
@@ -235,9 +233,16 @@
                 return () => window.removeEventListener('hashchange', handleHashChange);
             }, []);
 
-            const handleActionSelect = (slug) => {
-                const newTransactionId = crypto.randomUUID();
-                window.location.hash = `action/${slug}/transaction/${newTransactionId}`;
+            const handleActionSelect = async (slug) => {
+                const response = await fetch("/api/transaction/invoke", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ actionSlug: slug }),
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    window.location.hash = `action/${slug}/transaction/${data.transactionId}`;
+                }
             };
 
             return (
