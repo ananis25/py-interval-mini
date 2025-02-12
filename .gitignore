@@ -176,3 +176,4 @@ cython_debug/
 # Interval
 interval.db
 .python-version
+restate-data/
