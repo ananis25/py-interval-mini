@@ -1,571 +1,344 @@
 import asyncio
-import contextlib
-import enum
 import json
-import os
-import time
 import uuid
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Dict
 
-import aiosqlite
 import fastapi
-from fastapi import FastAPI, HTTPException
+import httpx
+import restate
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from loguru import logger
 from pydantic import BaseModel
+from restate.context import WorkflowContext, WorkflowSharedContext
+from restate.workflow import Workflow
 
-# Type alias for an action function.
-# Each action receives a Transaction instance and returns an awaitable.
-ActionFunction = Callable[["Transaction"], Awaitable[Any]]
+RESTATE_SERVER_URL = "http://localhost:8080"
+EVENT_PUBLISH_QUEUE = asyncio.Queue(maxsize=50)
 
-
-class TransactionStatus(enum.Enum):
-    NOT_INITIALIZED = "not_initialized"
-    RUNNING = "running"
-    SUSPENDED = "suspended"
-    SUCCESS = "success"
-    ERROR = "error"
+# ------------------------------
+# Action definitions
+# ------------------------------
 
 
-class EventType(enum.Enum):
-    IO = "io"
-
-
-TIMEOUT_IO_REQUEST = 10
-
-
-class GlobalLock:
-    _locks: Dict[str, asyncio.Lock] = {}
+class Action:
+    def __init__(self, ctx: WorkflowContext):
+        self.ctx = ctx
+        self.event_counter = 0
 
     @classmethod
-    async def acquire(cls, key: str) -> None:
-        if key not in cls._locks:
-            cls._locks[key] = asyncio.Lock()
-        await cls._locks[key].acquire()
-
-    @classmethod
-    async def release(cls, key: str) -> None:
-        if key in cls._locks:
-            cls._locks[key].release()
-            if not cls._locks[key].locked():
-                del cls._locks[key]
-
-
-# ------------------------------
-# DATABASE SCHEMA INITIALIZATION
-# ------------------------------
-
-
-async def init_db(db: aiosqlite.Connection):
-    db.row_factory = aiosqlite.Row
-
-    # Create a table for transactions with UUID primary key
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id TEXT PRIMARY KEY,
-            action_slug TEXT,
-            status TEXT,
-            result TEXT,
-            update_count INTEGER DEFAULT 1,
-            created_at REAL,
-            updated_at REAL
-        )
-    """)
-
-    # Create a table for all steps in a transaction
-    # data is a JSON string of step data. For IO requests, this is the request body. If it been responded to, the response is put under the "response" key.
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS steps (
-            transaction_id TEXT,
-            step_index INTEGER,
-            step_type TEXT,
-            data TEXT,
-            response TEXT,
-            created_at REAL,
-            updated_at REAL,
-            FOREIGN KEY(transaction_id) REFERENCES transactions(id)
-            PRIMARY KEY(transaction_id, step_index)
-        )
-    """)
-    await db.commit()
-
-
-# ------------------------------
-# TRANSACTION CLASS
-# ------------------------------
-
-
-class Transaction:
-    """
-    A Transaction is a wrapper around a workflow instance.
-    It uses the DB connection via the ASGI app's state to update and report its state.
-    No in memory state is maintained, queries the DB for the current state on each access.
-    """
-
-    def __init__(self, transaction_id: str, app: FastAPI):
-        self.app = app
-        self.id = transaction_id
-        self.step_count = 0
-        self.pending_io_request = None
-
-    async def _initialize(self, action_slug: str):
-        """
-        Start the transaction. If it already exists, no action is taken.
-        """
-        db: aiosqlite.Connection = self.app.state.db
-        now = int(time.time())
-
-        await db.execute(
-            """
-            INSERT INTO transactions (id, action_slug, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO NOTHING
-            """,
-            (
-                self.id,
-                action_slug,
-                TransactionStatus.RUNNING.value,
-                now,
-                now,
-            ),
-        )
-        await db.commit()
-        await self.publish_event()
-
-    async def update(self, status: str, result: Optional[Any] = None):
-        """Update the transactions table for this transaction and publish an event."""
-        db: aiosqlite.Connection = self.app.state.db
-
-        await db.execute(
-            "UPDATE transactions SET status = ?, result = ?, update_count = update_count + 1, updated_at = ? WHERE id = ?",
-            (status, json.dumps(result) if result else None, int(time.time()), self.id),
-        )
-        await db.commit()
-        await self.publish_event()
+    def name(cls) -> str:
+        return cls.__name__.lower()
 
     async def publish_event(self):
-        """Publish an event to the event queue."""
-
-        state = await self.render()
-        for queue in self.app.state.event_queues.get(self.id, []):
-            await queue.put(state)
-        print(f"Published event for transaction {self.id}")
-
-    async def io(self, method: str, payload: Dict[str, Any]) -> Any:
         """
-        This helper suspends the action awaiting user input.
-        Includes timeout handling and ability to resume from previous IO state.
+        Publish an event to the message queue, exactly once.
         """
-        db: aiosqlite.Connection = self.app.state.db
-        now = int(time.time())
+        payload = {
+            "data": await self.ctx.get("render"),
+            "workflow_id": self.ctx.key(),
+            "workflow_name": self.name(),
+        }
 
-        # Increment the step count
-        self.step_count += 1
+        async def _publish():
+            logger.info(f"Publishing event: {payload}")
+            await EVENT_PUBLISH_QUEUE.put(payload)
 
-        # Check if this step has been processed before, even partially.
-        step_seen_before = False
-        async with db.execute(
-            "SELECT * FROM steps WHERE transaction_id = ? AND step_index = ?",
-            (self.id, self.step_count),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row is not None:
-                step_seen_before = True
-                if row["response"] is not None:
-                    return json.loads(row["response"])
+        await self.ctx.run("publish-event", _publish)
 
-        # Insert the IO request into the steps table.
-        request_data = dict(method=method, payload=payload)
-
-        if not step_seen_before:
-            await db.execute(
-                """
-                INSERT INTO steps (transaction_id, step_index, step_type, data, response, created_at, updated_at) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    self.id,
-                    self.step_count,
-                    "io",
-                    json.dumps(request_data),
-                    None,
-                    now,
-                    now,
-                ),
-            )
-            await db.commit()
-
-        # Create a Future and store it for later resolution.
-        request_id = f"{self.id}-{self.step_count}"
-        future = asyncio.get_event_loop().create_future()
-        self.pending_io_request = {"future": future, "request_id": request_id}
-
-        # Update the transaction state. If the transaction timed out earlier, the transaction
-        # would be ina suspended state already.
-        if not step_seen_before:
-            await self.update(status=TransactionStatus.SUSPENDED.value)
-
-        # Action waits here until response is set. If it times out, the transaction will be
-        # removed from the active transactions list, and restored later when the response arrives.
-        async with asyncio.timeout(TIMEOUT_IO_REQUEST):
-            result = await future
-
-        # Once resolved, update the IO request record.
-        await db.execute(
-            "UPDATE steps SET response = ?, updated_at = ? WHERE transaction_id = ? AND step_index = ?",
-            (json.dumps(result), now, self.id, self.step_count),
+    async def io(self, method: str, payload: Dict[str, Any]) -> str:
+        """Suspend the workflow for a user input."""
+        self.event_counter += 1
+        key = f"io-{self.event_counter}"
+        promise = self.ctx.promise(key)
+        self.ctx.set(
+            "render",
+            {
+                "type": "io",
+                "data": {"id": key, "method": method, "payload": payload},
+            },
         )
-        await db.commit()
+        await self.publish_event()
+        return await promise.value()
 
-        # Update the transaction state.
-        await self.update(status=TransactionStatus.RUNNING.value)
+    @classmethod
+    def workflow(cls) -> Workflow:
+        wf = Workflow(name=cls.name())
 
-        # Clear the pending io future.
-        self.pending_io_request = None
+        @wf.main(name="run")
+        async def _run(ctx: WorkflowContext):
+            action = cls(ctx)
 
-        return result
+            ctx.set(
+                "render",
+                {"type": "text", "data": "status: started"},
+            )
+            await action.publish_event()
 
-    async def run(self, action_slug: str):
-        try:
-            self.app.state.transactions_active[self.id] = self
-            await self._initialize(action_slug)
-            result = await self.app.state.actions[action_slug](self)
-            await self.update(status=TransactionStatus.SUCCESS.value, result=result)
-            print(f"Transaction {self.id} finished with result: {result}")
-        except TimeoutError:
-            print(f"Transaction {self.id} timed out while suspended on IO request.")
-        except Exception as e:
-            await self.update(status=TransactionStatus.ERROR.value, result=str(e))
-            print(f"Transaction {self.id} errored: {e}")
-        finally:
-            self.app.state.transactions_active.pop(self.id, None)
+            try:
+                result = await action.run()
+                ctx.set(
+                    "render",
+                    {"type": "text", "data": f"status: success\nresult: {result}"},
+                )
+            except Exception as e:
+                ctx.set(
+                    "render",
+                    {"type": "text", "data": f"status: error\nerror: {e}"},
+                )
+                await action.publish_event()
+                raise
+            await action.publish_event()
 
-    async def render(self):
-        """Render the current state of the transaction as a JSON object, that the frontend can use to render the UI.
-        Must cover all casese
-        - if it isn't running yet, we want a start button
-        - if it is running, probably a loading spinner
-        - if it is suspended on an IO request, we want to display the IO request form for the user to respond to.
-        - if it has finished with success/error, we want to display the final state.
-        """
+            return result
 
-        async with self.app.state.db.execute(
-            "SELECT status, result, update_count FROM transactions WHERE id = ?",
-            (self.id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row is None:
-                return {
-                    "status": TransactionStatus.NOT_INITIALIZED.value,
-                    "updateCount": 0,
-                }
+        @wf.handler(name="render")
+        async def _render(ctx: WorkflowSharedContext):
+            return await ctx.get("render")
 
-        if row["status"] == TransactionStatus.RUNNING.value:
-            return {
-                "status": TransactionStatus.RUNNING.value,
-                "updateCount": row["update_count"],
-            }
-        elif row["status"] == TransactionStatus.SUSPENDED.value:
-            async with self.app.state.db.execute(
-                """
-                SELECT step_index, data 
-                FROM steps 
-                WHERE transaction_id = ? AND response IS NULL 
-                ORDER BY step_index DESC 
-                LIMIT 1
-                """,
-                (self.id,),
-            ) as cursor:
-                step = await cursor.fetchone()
-                if step is None:
-                    raise ValueError(
-                        "Transaction suspended but no pending IO request found"
-                    )
+        @wf.handler(name="io")
+        async def _io(ctx: WorkflowSharedContext, payload: Dict[str, Any]):
+            # TODO: Add validation and reject the promise if the data is invalid
+            return await ctx.promise(payload["key"]).resolve(payload["data"])
 
-                request_data = json.loads(step["data"])
-                return {
-                    "status": TransactionStatus.SUSPENDED.value,
-                    "updateCount": row["update_count"],
-                    "ioRequest": {
-                        "id": f"{self.id}-{step['step_index']}",
-                        "method": request_data["method"],
-                        "payload": request_data["payload"],
-                    },
-                }
-        elif row["status"] in [
-            TransactionStatus.SUCCESS.value,
-            TransactionStatus.ERROR.value,
-        ]:
-            return {
-                "status": row["status"],
-                "result": json.loads(row["result"]) if row["result"] else None,
-                "updateCount": row["update_count"],
-            }
-        else:
-            raise ValueError(f"Unknown transaction status: {row['status']}")
+        return wf
+
+    async def run(self):
+        raise NotImplementedError()
+
+
+class HelloWorld(Action):
+    async def run(self):
+        first = await self.io("INPUT_TEXT", {"label": "What is your first name?"})
+        last = await self.io("INPUT_TEXT", {"label": "What is your last name?"})
+        return f"Hello {first} {last}"
+
+
+class AddNumbers(Action):
+    async def run(self):
+        total_numbers = await self.io(
+            "INPUT_TEXT", {"label": "How many numbers do you want to sum?"}
+        )
+        numbers = []
+        for i in range(int(total_numbers)):
+            number = await self.io("INPUT_TEXT", {"label": f"Enter number {i + 1}"})
+            numbers.append(int(number))
+        return sum(numbers)
+
+
+ALL_WORKFLOWS = [HelloWorld.workflow(), AddNumbers.workflow()]
 
 
 # ------------------------------
-# Pydantic Models for RPC
+# FastAPI App
 # ------------------------------
 
 
-class InvokeTransactionRequest(BaseModel):
-    actionSlug: str
+def create_restate_app():
+    return restate.endpoint.app(ALL_WORKFLOWS)
 
 
-# ------------------------------
-# APP FACTORY
-# ------------------------------
-
-
-def create_interval_app(
-    *,
-    static_dir: str,
-    db_path: str = "database.db",
-    actions: Dict[str, ActionFunction],
-) -> FastAPI:
-    """
-    Factory function to create an Interval-style ASGI app.
-
-    - db_path: Path to the SQLite database file.
-    - actions: Dictionary mapping action slugs to async functions.
-    - static_dir: Optional directory containing UI files to serve.
-    """
-
-    @contextlib.asynccontextmanager
-    async def lifespan(app: FastAPI):
-        # Open the database and initialize schema.
-        app.state.db = await aiosqlite.connect(db_path)
-        await init_db(app.state.db)
-        print(f"Connected to SQLite DB at {db_path}")
-
-        try:
-            yield
-        finally:
-            # Cancel any pending IO futures
-            for tx in app.state.transactions_active.values():
-                if (
-                    tx.pending_io_request is not None
-                    and not tx.pending_io_request["future"].done()
-                ):
-                    tx.pending_io_request["future"].set_exception(
-                        TimeoutError("Application shutdown")
-                    )
-
-            # Cleanup all event queues
-            for tx_id in app.state.event_queues:
-                for queue in app.state.event_queues[tx_id]:
-                    queue.put_nowait(None)
-            app.state.event_queues.clear()
-
-            # Close the database connection
-            if hasattr(app.state, "db"):
-                await app.state.db.close()
-                print("DB connection closed.")
-
-    app = FastAPI(lifespan=lifespan)
-
-    # Allow CORS (adjust as needed)
+def create_interval_app(*, static_dir: str) -> FastAPI:
+    app = FastAPI()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    # Place to store runtime state.
-    # These are used only for pending (in-flight) transactions.
-    app.state.db_path = db_path
-    app.state.actions = actions
-    app.state.transactions_active = {}
     app.state.event_queues = {}
 
-    async def event_stream(tx_id: str):
-        """Event stream for a transaction."""
-
-        queue = asyncio.Queue()
-        if tx_id not in app.state.event_queues:
-            app.state.event_queues[tx_id] = []
-        app.state.event_queues[tx_id].append(queue)
-
-        try:
-            # Send the initial state, and updates afterwards
-            tx = Transaction(tx_id, app)
-            state = await tx.render()
-            yield f"data: {json.dumps(state)}\n\n"
-
-            while True:
-                state = await queue.get()
-                if state is None:
-                    break
-                yield f"data: {json.dumps(state)}\n\n"
-        finally:
-            if tx_id in app.state.event_queues:
-                app.state.event_queues[tx_id].remove(queue)
-
-    async def run_transaction(tx_id: str, action_slug: str):
-        try:
-            tx = Transaction(tx_id, app)
-            app.state.transactions_active[tx_id] = tx
-            await tx.run(action_slug)
-        except TimeoutError:
-            print(f"Transaction {tx_id} timed out while suspended on IO request.")
-        finally:
-            app.state.transactions_active.pop(tx_id, None)
+    class ActionInvokeRequest(BaseModel):
+        actionSlug: str
 
     # ------------------------------
-    # API ENDPOINTS
+    # API endpoints
     # ------------------------------
 
-    @app.post("/api/transaction/invoke")
-    async def invoke_transaction(req: InvokeTransactionRequest):
-        print(f"Received invoke_transaction request: {req}")
-
-        action_slug = req.actionSlug
-        if action_slug not in app.state.actions:
-            raise HTTPException(status_code=404, detail="Action not found")
-
-        tx_id = str(uuid.uuid4())
-
-        await GlobalLock.acquire(tx_id)
-        tx = Transaction(tx_id, app)
-        if app.state.transactions_active.get(tx_id, None) is not None:
-            raise HTTPException(status_code=400, detail="Transaction already exists")
-        asyncio.create_task(tx.run(action_slug))
-        await GlobalLock.release(tx_id)
-
-        print(f"Created transaction {tx_id}")
-        return {"status": "ok", "transactionId": tx_id}
-
-    @app.get("/api/transaction/{transaction_id}/events")
-    async def subscribe_events(transaction_id: str):
-        return StreamingResponse(
-            event_stream(transaction_id), media_type="text/event-stream"
-        )
-
-    @app.post("/api/transaction/state")
-    async def get_transaction_state(req: fastapi.Request):
-        body = await req.json()
-        print(f"Received get_transaction_state request: {body}")
-
-        tx = Transaction(body["transactionId"], app)
-        return await tx.render()
-
-    @app.post("/api/transaction/io")
-    async def process_io_response(req: fastapi.Request):
-        body = await req.json()
-        print(f"Received IO response: {body}")
-
-        tx_id = body["transactionId"]
-        await GlobalLock.acquire(tx_id)
-
-        # Get or restore transaction
-        if tx_id not in app.state.transactions_active:
-            print(f"Transaction {tx_id} not found, restoring from DB")
-
-            async with app.state.db.execute(
-                "SELECT action_slug FROM transactions WHERE id = ?", (tx_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail="Transaction not found")
-
-            # Restart the transaction and wait for it to reach IO state
-            tx = Transaction(tx_id, app)
-            task = asyncio.create_task(tx.run(row["action_slug"]))
-
-            # Wait for transaction to reach suspended state or complete
-            while True:
-                await asyncio.sleep(0.1)  # Small delay to prevent busy waiting
-                if (
-                    app.state.transactions_active.get(tx_id, None)
-                    and app.state.transactions_active[tx_id].pending_io_request
-                ):
-                    break
-                if task.done():
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Transaction completed without reaching expected IO state",
-                    )
-
-        # Verify request ID and set result
-        tx = app.state.transactions_active[tx_id]
-        if tx.pending_io_request["request_id"] != body["requestId"]:
-            raise HTTPException(status_code=400, detail="Request ID mismatch")
-
-        tx.pending_io_request["future"].set_result(body["body"])
-        await GlobalLock.release(tx_id)
-
+    @app.get("/test")
+    async def test():
         return {"status": "ok"}
 
-    @app.post("/api/transaction/list")
+    @app.post("/transaction/invoke")
+    async def invoke_transaction(req: ActionInvokeRequest):
+        """
+        Invoke a new transaction for the given action.
+        """
+        workflow_name = req.actionSlug
+        if workflow_name not in [wf.name for wf in ALL_WORKFLOWS]:
+            raise fastapi.HTTPException(status_code=404, detail="Action not found")
+
+        workflow_id = str(uuid.uuid4())
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{RESTATE_SERVER_URL}/{workflow_name}/{workflow_id}/run/send",
+                    json={},
+                )
+                logger.info(f"Response status: {response.status_code}")
+                if response.is_success:
+                    return {"status": "ok", "transactionId": workflow_id}
+                else:
+                    response.raise_for_status()
+
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            raise fastapi.HTTPException(
+                status_code=500, detail="Workflow invocation failed"
+            )
+
+    @app.post("/transaction/io")
+    async def process_io_response(req: fastapi.Request):
+        """
+        Process an IO response from the given transaction.
+        """
+        body = await req.json()
+
+        workflow_name = body["actionSlug"]
+        workflow_id = body["transactionId"]
+
+        # Resolve the promise with the IO response
+        async with httpx.AsyncClient() as client:
+            _response = await client.post(
+                f"{RESTATE_SERVER_URL}/{workflow_name}/{workflow_id}/io",
+                json={"key": body["requestId"], "data": body["body"]},
+            )
+            return {"status": "ok"}
+
+    @app.post("/transaction/state")
+    async def get_transaction_state(req: fastapi.Request):
+        """
+        Get the current render state of the given transaction.
+        """
+        body = await req.json()
+        logger.info(f"Received get_transaction_state request: {body}")
+
+        workflow_name = body["actionSlug"]
+        workflow_id = body["transactionId"]
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{RESTATE_SERVER_URL}/{workflow_name}/{workflow_id}/render"
+            )
+            return response.json()
+
+    @app.get("/transaction/events/{actionSlug}/{transactionId}")
+    async def subscribe_events(actionSlug: str, transactionId: str):
+        """
+        Set up an SSE stream to listen for events on the given transaction.
+        """
+
+        async def event_stream():
+            workflow_name = actionSlug
+            workflow_id = transactionId
+
+            queue = asyncio.Queue()
+            if workflow_id not in app.state.event_queues:
+                app.state.event_queues[workflow_id] = []
+            app.state.event_queues[workflow_id].append(queue)
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        f"{RESTATE_SERVER_URL}/{workflow_name}/{workflow_id}/render"
+                    )
+                    data = response.json()
+                    yield f"data: {json.dumps(data)}\n\n"
+
+                while True:
+                    event = await queue.get()
+                    yield f"data: {json.dumps(event['data'])}\n\n"
+
+            finally:
+                if workflow_id in app.state.event_queues:
+                    app.state.event_queues[workflow_id].remove(queue)
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    @app.post("/transaction/list")
     async def list_transactions():
-        # Return all transactions from the DB.
-        db: aiosqlite.Connection = app.state.db
-        cursor = await db.execute("SELECT * FROM transactions")
-        rows = await cursor.fetchall()
+        """
+        List all transactions.
+        """
+        process = await asyncio.create_subprocess_shell(
+            """
+            restate sql "select * from sys_invocation where target_service_ty='workflow'" --json
+            """,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
 
-        fields = ["id", "action_slug", "status", "result", "created_at", "updated_at"]
-        return [{f: row[f] for f in fields} for row in rows]
+        # Find the JSON lines in the output (skip header line)
+        rows = []
+        for line in stdout.decode().split("\n"):
+            if line.startswith("["):
+                rows.extend(json.loads(line.strip()))
+        return [
+            {
+                "id": row["target_service_key"],
+                "action_slug": row["target_service_name"],
+                "status": row["status"],
+                "result": row.get("completion_result", None),
+                "created_at": row["created_at"],
+                "updated_at": row["modified_at"],
+            }
+            for row in rows
+        ]
 
-    @app.post("/api/action/list")
+    @app.post("/action/list")
     async def list_available_actions():
-        return [{"slug": slug} for slug in app.state.actions.keys()]
-
-    # ------------------------------
-    # UI SERVING
-    # ------------------------------
-
-    # Mount the static files app at "/".
-    assert os.path.isdir(static_dir)
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-    print(f"Serving UI from {static_dir}")
+        """
+        List all available actions.
+        """
+        return [{"slug": slug.name} for slug in ALL_WORKFLOWS]
 
     return app
 
 
-# ------------------------------
-# MAIN ENTRY POINT (for testing)
-# ------------------------------
-
 if __name__ == "__main__":
-    import uvicorn
+    import hypercorn.asyncio
+    from hypercorn.config import Config
+    from hypercorn.middleware import DispatcherMiddleware
 
-    # Example action: a simple hello-world workflow.
-    async def hello_world(tx: Transaction):
-        first = await tx.io("INPUT_TEXT", {"label": "What is your first name?"})
-        last = await tx.io("INPUT_TEXT", {"label": "What is your last name?"})
-        greeting = f"Hello {first} {last}"
-        return greeting
+    # Create all the apps
+    restate_app = create_restate_app()
+    server_app = create_interval_app(static_dir="ui")
+    static_app = StaticFiles(directory="ui", html=True)
 
-    async def add_numbers(tx: Transaction):
-        total_numbers = await tx.io(
-            "INPUT_TEXT", {"label": "How many numbers do you want to sum?"}
-        )
-        numbers = []
-        for i in range(int(total_numbers)):
-            number = await tx.io("INPUT_TEXT", {"label": f"Enter number {i + 1}"})
-            numbers.append(int(number))
-        return sum(numbers)
-
-    # Register actions and initialize the app.
-    my_actions = {
-        "hello_world": hello_world,
-        "add_numbers": add_numbers,
-    }
-    app = create_interval_app(
-        db_path="interval.db",
-        actions=my_actions,
-        static_dir="/home/ubuntu/repos/interval-mini/py-sdk/ui",
+    app = DispatcherMiddleware(
+        {
+            "/api": server_app,
+            "/worker": restate_app,
+            "/": static_app,
+        }  # type: ignore
     )
 
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info",
-        timeout_keep_alive=2,
-        timeout_graceful_shutdown=2,
-    )
+    async def events_consumer(server_app):
+        """
+        FIXME: Hack to get around Hypercorn not supporting the lifespan method.
+        """
+        logger.info("Starting event consumer")
+        while True:
+            event = await EVENT_PUBLISH_QUEUE.get()
+            logger.info(f"Consuming event: {event}")
+            for subscriber in server_app.state.event_queues.get(
+                event["workflow_id"], []
+            ):
+                await subscriber.put(event)
+
+    # Run the combined app with Hypercorn
+    async def run_app():
+        config = Config()
+        config.bind = ["localhost:8000"]
+
+        consumer_task = asyncio.create_task(events_consumer(server_app))
+        try:
+            await hypercorn.asyncio.serve(app, config)
+        finally:
+            logger.info("Cancelling event consumer")
+            consumer_task.cancel()
+
+    asyncio.run(run_app())

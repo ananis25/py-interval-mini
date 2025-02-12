@@ -47,26 +47,49 @@
             const [transactions, setTransactions] = React.useState([]);
 
             React.useEffect(() => {
-                // Fetch available actions and transactions on component mount
+                // Create an AbortController instance
+                const abortController = new AbortController();
+
+                // Modified fetch functions to use the signal
+                const fetchActions = async () => {
+                    try {
+                        const response = await fetch("/api/action/list", {
+                            method: "POST",
+                            signal: abortController.signal
+                        });
+                        const data = await response.json();
+                        setActions(data);
+                    } catch (err) {
+                        if (!err.name === 'AbortError') {
+                            console.error('Fetch error:', err);
+                        }
+                    }
+                };
+
+                const fetchTransactions = async () => {
+                    try {
+                        const response = await fetch("/api/transaction/list", {
+                            method: "POST",
+                            signal: abortController.signal
+                        });
+                        const data = await response.json();
+                        setTransactions(data);
+                    } catch (err) {
+                        if (!err.name === 'AbortError') {
+                            console.error('Fetch error:', err);
+                        }
+                    }
+                };
+
+                // Fetch data
                 fetchActions();
                 fetchTransactions();
+
+                // Cleanup function to abort pending requests when component unmounts
+                return () => {
+                    abortController.abort();
+                };
             }, []);
-
-            const fetchActions = async () => {
-                const response = await fetch("/api/action/list", {
-                    method: "POST"
-                });
-                const data = await response.json();
-                setActions(data);
-            };
-
-            const fetchTransactions = async () => {
-                const response = await fetch("/api/transaction/list", {
-                    method: "POST"
-                });
-                const data = await response.json();
-                setTransactions(data);
-            };
 
             return (
                 <div>
@@ -106,21 +129,16 @@
         function TransactionView({ actionSlug, transactionId, onClose }) {
             const [state, setState] = React.useState(null);
             const [inputValue, setInputValue] = React.useState("");
-            const [loading, setLoading] = React.useState(false);
 
             React.useEffect(() => {
-                let eventSource = new EventSource(`/api/transaction/${transactionId}/events`);
+                let eventSource = new EventSource(`/api/transaction/events/${actionSlug}/${transactionId}`);
 
                 eventSource.onmessage = (e) => {
-                    const newState = JSON.parse(e.data);
-                    console.log("State update:", newState);
-
-                    if (!state || newState.updateCount > state.updateCount) {
-                        setState(newState);
-                    } else {
-                        console.log("Update already processed");
-                    }
+                    const event = JSON.parse(e.data);
+                    console.log(event);
+                    setState(event);
                 };
+
                 eventSource.onerror = (error) => {
                     console.error('EventSource failed:', error);
                     eventSource.close();
@@ -131,18 +149,18 @@
                         eventSource.close();
                     }
                 };
-            }, [transactionId]);
+            }, [actionSlug, transactionId]);
 
-            // When an IO request is pending, send the response to the server
             const respondIO = async () => {
-                if (!state.ioRequest) return;
+                if (!state || state.type !== 'io') return;
                 try {
                     const res = await fetch("/api/transaction/io", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
+                            actionSlug,
                             transactionId,
-                            requestId: state.ioRequest.id,
+                            requestId: state.data.id,
                             body: inputValue,
                         }),
                     });
@@ -162,40 +180,18 @@
 
                     {state && (
                         <div style={{ marginTop: "20px" }}>
-                            <p>Status: {state.status}</p>
-                            {state.status === "not_initialized" && (
-                                <div>
-                                    <p>Transaction not found</p>
-                                </div>
+                            {state.type === "text" && (
+                                <pre>{state.data}</pre>
                             )}
-                            {state.status === "suspended" && state.ioRequest && (
+                            {state.type === "io" && (
                                 <div style={{ margin: "10px 0" }}>
-                                    <p>{state.ioRequest.payload.label || "Enter input:"}</p>
+                                    <p>{state.data.payload.label || "Enter input:"}</p>
                                     <input
                                         type="text"
                                         value={inputValue}
                                         onChange={(e) => setInputValue(e.target.value)}
                                     />
                                     <button onClick={respondIO}>Submit</button>
-                                </div>
-                            )}
-                            {(state.status === "success" || state.status === "error") && (
-                                <div>
-                                    <p>Result:</p>
-                                    <pre>{JSON.stringify(state.result, null, 2)}</pre>
-                                    <button onClick={async () => {
-                                        const response = await fetch("/api/transaction/invoke", {
-                                            method: "POST",
-                                            headers: { "Content-Type": "application/json" },
-                                            body: JSON.stringify({ actionSlug }),
-                                        });
-                                        const data = await response.json();
-                                        if (response.ok) {
-                                            window.location.hash = `action/${actionSlug}/transaction/${data.transactionId}`;
-                                        }
-                                    }}>
-                                        Start New Transaction
-                                    </button>
                                 </div>
                             )}
                         </div>
@@ -268,7 +264,8 @@
                 running: '#2196F3',
                 success: '#4CAF50',
                 error: '#F44336',
-                suspended: '#FF9800'
+                suspended: '#FF9800',
+                completed: '#4CAF50'  // Add completed status color
             };
             return colors[status] || '#757575';
         }

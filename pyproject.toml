@@ -7,5 +7,9 @@ requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.21.0",
     "fastapi>=0.115.8",
+    "httpx>=0.28.1",
+    "hypercorn>=0.17.3",
+    "loguru>=0.7.3",
+    "restate-sdk>=0.4.1",
     "uvicorn>=0.34.0",
 ]

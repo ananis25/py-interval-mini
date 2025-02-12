@@ -2,16 +2,25 @@ I like the idea behind [Interval](https://interval.com/). You write workflows (c
 
 The Interval github org also has a [mini version](https://github.com/interval/mini/) of it, where the "actions" (code that implements the business logic), and the Interval "server" (what users connect to) are run in the same server. This makes things easier to run, if less scalable. 
 
-This repo implements a single module version of Interval mini in python, backed by a sqlite database which makes action runs persistent. 
+This repo implements a single module version of Interval mini in python, backed by a [Restate](https://restate.dev/) deployment. Interval actions map one to one to async functions, and Restate workflows are basically persistent async functions. Restate takes care of all the state management, persistence, and retries for you, so we can focus on the content of the actions and how to render the UI.
 
 ## How to run
+
+The server module hosts both the Restate workflow worker and a FastAPI server that manages user interactions. 
 
 ```bash
 uv sync
 uv run server.py # implements some toy actions (workflows)
 ```
 
-Access the UI in the web browser at `http://localhost:8000`.
+Deploy a local Restate server by downloading the restate binary and register the workflow worker app with it. 
+
+```bash
+restate-server
+restate deployments register http://localhost:8000/worker
+```
+
+Now, the UI is accessible in the web browser at `http://localhost:8000`.
 
 ## Context for LLM
 
