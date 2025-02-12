@@ -1,4 +1,4 @@
-I like the idea behind [Interval](https://interval.com/). You write workflows (called as "actions") as async routines which suspend every time they need a user input. Each execution of an action is called a "transaction". The framework takes care of rendering the UI, collecting the input, and resuming the workflow. 
+I like the idea behind [Interval](https://interval.com/). You write workflows (called as "actions", each execution of an action is a "transaction") as async routines which suspend every time they need a user input. The framework takes care of rendering the UI, collecting the input, and driving the workflow to completion.
 
 The Interval github org also has a [mini version](https://github.com/interval/mini/) of it, where the "actions" (code that implements the business logic), and the Interval "server" (what users connect to) are run in the same server. This makes things easier to run, if less scalable. 
 
